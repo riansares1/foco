@@ -333,3 +333,10 @@ select.inp { background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
 }
+
+/* ---------- Gasto real ---------- */
+.real-spend { display: flex; align-items: center; gap: 16px; width: 100%; text-align: left; background: var(--lime); border-radius: var(--r-lg); padding: 18px 22px; margin-bottom: 24px; }
+.real-spend .emo { font-size: 40px; }
+.real-spend .t { flex: 1; }
+.real-spend .t b { display: block; font-size: 19px; }
+.real-spend .t span { font-size: 14px; font-weight: 600; opacity: .75; }

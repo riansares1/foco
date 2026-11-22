@@ -1,6 +1,6 @@
 // Service worker: hace que la web funcione sin internet.
 // Sube este número cuando cambies algo para forzar la actualización.
-const CACHE = 'foco-v1';
+const CACHE = 'foco-v2';
 const CORE = ['./', 'index.html', 'styles.css', 'app.js', 'manifest.webmanifest', 'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png'];
 
 self.addEventListener('install', e => {

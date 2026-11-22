@@ -56,9 +56,10 @@ function defaultState() {
       { id: uid(), subjectId: wolly.id, categoryId: wolly.categories[1].id, kind: 'weekly', minutes: 180, days: [0, 1, 2, 3, 4, 5, 6], deadline: '', startDate: today, bonus: 0, bonusType: 'oro', createdAt: Date.now() },
     ],
     awards: [],
+    penalties: [],
     active: null,
     lastSubjectId: null,
-    settings: { strict: true, grace: 20 },
+    settings: { strict: true, grace: 20, penalty: 1, penaltyType: 'plata' },
   };
 }
 
@@ -71,7 +72,7 @@ function load() {
     if (raw) {
       const s = JSON.parse(raw);
       const d = defaultState();
-      return { ...d, ...s, settings: { ...d.settings, ...(s.settings || {}) } };
+      return { ...d, ...s, penalties: s.penalties || [], settings: { ...d.settings, ...(s.settings || {}) } };
     }
   } catch (e) { console.warn(e); }
   return defaultState();
@@ -135,6 +136,7 @@ function wallet() {
   for (const s of state.sessions) s.coinType === 'oro' ? oro += s.coins : plata += s.coins;
   for (const a of state.awards) a.coinType === 'oro' ? oro += a.amount : plata += a.amount;
   for (const p of state.purchases) { oro -= p.paid.oro; plata -= p.paid.plata; }
+  for (const p of state.penalties || []) p.coinType === 'oro' ? oro -= p.amount : plata -= p.amount;
   for (const e of state.exchanges) { oro += e.oro; plata -= e.oro * 2; }
   return { oro: r2(oro), plata: r2(plata) };
 }
@@ -180,6 +182,82 @@ function goalTag(g) {
   if (g.kind === 'weekly') return 'Semanal';
   return 'Antes del ' + shortDate(parseDay(g.deadline));
 }
+
+/* ---------------- Rachas, pases y penalizaciones ---------------- */
+function monthKey(d) { const x = new Date(d); return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}`; }
+function monthsBetween(a, b) { const [y1, m1] = a.split('-').map(Number), [y2, m2] = b.split('-').map(Number); return (y2 * 12 + m2) - (y1 * 12 + m1); }
+function periodStart(g, d) { return g.kind === 'weekly' ? startOfWeek(d) : startOfDay(d); }
+// Prepara un objetivo para llevar su racha (al crearlo, al cambiarle el tipo o en datos antiguos)
+function initTracking(g, keepPasses = false) {
+  const now = new Date();
+  g.streak = 0; g.best = g.best || 0;
+  if (!keepPasses) g.passes = g.kind === 'deadline' ? 0 : 1;
+  g.passMonth = monthKey(now);
+  g.evalFrom = g.kind === 'deadline' ? '' : dayKey(periodStart(g, now));
+  g.graceKey = g.kind === 'weekly' ? 'w' + g.evalFrom : g.evalFrom; // el primer periodo no penaliza
+  g.settled = false;
+}
+function currentStreak(g) {
+  if (g.kind === 'deadline') return 0;
+  const now = new Date();
+  const live = (g.kind === 'weekly' || goalApplies(g, now)) && goalProgress(g, now).complete ? 1 : 0;
+  return (g.streak || 0) + live;
+}
+function penalize(g, key, why, events) {
+  const amount = Number(state.settings.penalty) || 0; if (!amount) return;
+  const p = { id: uid(), goalId: g.id, key, amount, coinType: state.settings.penaltyType || 'plata', date: Date.now(), name: `${why}: ${goalTitle(g)}` };
+  const ev = { t: 'penalty', g, p }; state.penalties.push(p); events.push(ev); return ev;
+}
+function evalPeriod(g, date, key, events) {
+  const pr = goalProgress(g, date);
+  if (pr.complete) { g.streak = (g.streak || 0) + 1; g.best = Math.max(g.best || 0, g.streak); return; }
+  if (key === g.graceKey) return; // periodo en el que se creó: ni suma ni penaliza
+  if ((g.passes || 0) > 0) { g.passes--; events.push({ t: 'pass', g, date, left: g.passes }); return; }
+  const lost = g.streak || 0; g.streak = 0;
+  const ev = penalize(g, key, 'Racha perdida', events); if (ev) ev.lost = lost;
+}
+function settle() {
+  if (!state.setupDone) return [];
+  const now = new Date(), mk = monthKey(now), events = [];
+  let newPasses = 0;
+  for (const g of state.goals) {
+    if (g.evalFrom === undefined) initTracking(g);
+    if (g.kind !== 'deadline' && g.passMonth !== mk) {
+      const n = Math.max(0, monthsBetween(g.passMonth, mk));
+      g.passes = (g.passes || 0) + n; g.passMonth = mk; newPasses += n;
+    }
+    if (g.kind === 'daily') {
+      const today = startOfDay(now);
+      for (let d = parseDay(g.evalFrom); d < today; d = addDays(d, 1)) if (goalApplies(g, d)) evalPeriod(g, d, dayKey(d), events);
+      g.evalFrom = dayKey(today);
+    } else if (g.kind === 'weekly') {
+      const ws = startOfWeek(now);
+      for (let d = parseDay(g.evalFrom); d < ws; d = addDays(d, 7)) evalPeriod(g, d, 'w' + dayKey(d), events);
+      g.evalFrom = dayKey(ws);
+    } else if (!g.settled && g.deadline && dayKey(now) > g.deadline) {
+      g.settled = true;
+      if (!goalProgress(g, now).complete) penalize(g, 'deadline', 'Objetivo no cumplido', events);
+    }
+  }
+  if (newPasses) events.unshift({ t: 'newmonth', n: newPasses });
+  return events;
+}
+function runSettle() {
+  const ev = settle();
+  save();
+  if (!ev.length) return;
+  const line = e => {
+    if (e.t === 'newmonth') return `🎟️ <b>¡Nuevo mes!</b> Cada objetivo diario y semanal tiene un pase más.`;
+    if (e.t === 'pass') return `🎟️ Se usó un pase en <b>${esc(goalTitle(e.g))}</b>${e.g.kind === 'daily' ? ' (' + DAYS_LONG[wd(e.date)] + ' ' + e.date.getDate() + ')' : ''}. Racha a salvo · te quedan ${e.left}.`;
+    return `💔 <b>${esc(goalTitle(e.g))}</b>: ${e.lost ? `perdiste una racha de ${e.lost}` : e.g.kind === 'deadline' ? 'no llegaste a la fecha' : 'no se cumplió'} · −${fmtN(e.p.amount)} ${coin(e.p.coinType, 16)}`;
+  };
+  const bad = ev.some(e => e.t === 'penalty');
+  const show = () => openModal(() => `<div class="sheet"><h2>${bad ? 'Ay… cuentas pendientes' : 'Novedades de tus rachas'}</h2>
+    <div class="stack" style="gap:10px">${ev.map(e => `<div class="info-box" style="${e.t === 'penalty' ? 'background:#FFE3DF' : ''}"><div>${line(e)}</div></div>`).join('')}</div>
+    <div class="acts"><button class="btn dark" data-act="closeModal">${bad ? 'Vale, hoy lo hago mejor' : '¡Genial!'}</button></div></div>`);
+  if ($('#modal').hidden) show(); else setTimeout(() => $('#modal').hidden && show(), 1500);
+}
+
 function checkAwards() {
   const now = new Date();
   let got = [];
@@ -387,8 +465,9 @@ function goalCard(g, withActions, faded = false) {
     }).join('')}</div>`;
   }
   const bonus = g.bonus > 0 ? `<span class="tag">+${fmtN(g.bonus)} ${COIN_NAME[g.bonusType || 'oro']} bonus</span>` : '';
+  const stk = g.kind !== 'deadline' ? `<span class="tag dark">🔥 ${currentStreak(g)}</span><span class="tag">🎟️ ${g.passes || 0} pase${(g.passes || 0) === 1 ? '' : 's'}</span>` : '';
   return `<div class="goal-card ${pr.complete ? 'done' : ''}" style="background:${tint(s.color, .35)}${faded ? ';opacity:.55' : ''}">
-    <div class="gm"><div class="tags"><span class="tag">${goalTag(g)}</span>${bonus}</div>
+    <div class="gm"><div class="tags"><span class="tag">${goalTag(g)}</span>${stk}${bonus}</div>
       <div class="gt">${esc(goalTitle(g))}</div><div class="gs">${sub}</div>
       <div class="bar"><i style="width:${Math.round(pr.pct * 100)}%"></i></div>${dots}</div>
     <div class="gb">${buddy(s.shape, s.color, pr.complete ? 'happy' : pr.done > 0 ? 'focus' : 'idle')}</div>
@@ -574,6 +653,10 @@ function renderGoals() {
   }).join('');
   return `${topBar('Objetivos', 'Diarios, semanales o antes de una fecha')}
     <div style="margin-bottom:20px"><button class="btn dark" data-act="newGoal">${ICON.plus} Nuevo objetivo</button></div>
+    <div class="info-box" style="margin-bottom:22px;align-items:flex-start"><span style="font-size:26px">🔥</span><div><b>Cómo funcionan las rachas</b><br>
+      Cada objetivo cumplido suma 1 a su racha. Si un día (o una semana, que se cierra el domingo a las 24:00) no lo cumples, se usa un <b>pase 🎟️</b> automáticamente y la racha se salva.
+      Si no te quedan pases, pierdes la racha y ${fmtN(state.settings.penalty)} ${coin(state.settings.penaltyType, 16)} de ${state.settings.penaltyType}.
+      El día 1 de cada mes cada objetivo diario y semanal gana 1 pase (se acumulan). Los objetivos con fecha no tienen pases: si llega la fecha sin cumplirlo, también penaliza.</div></div>
     ${html || `<div class="card empty">${buddy('triangle', '#2EC4A6', 'googly')}Aún no tienes objetivos.<br>Por ejemplo: <b>10 h de Fluidos antes del examen</b> o <b>1 h al día de lectura</b>.</div>`}`;
 }
 function openGoal(id) {
@@ -608,6 +691,10 @@ function saveGoal() {
   if (d.kind === 'deadline' && (!d.deadline || d.deadline < d.startDate)) return toast('Revisa las fechas');
   const g = { id: d.id || uid(), subjectId: d.subjectId, categoryId: d.categoryId || null, kind: d.kind, minutes, days: d.days.sort(), deadline: d.deadline, startDate: d.startDate || dayKey(new Date()), bonus: Math.max(0, Number(d.bonus) || 0), bonusType: d.bonusType || 'oro', createdAt: d.createdAt || Date.now() };
   const i = state.goals.findIndex(x => x.id === g.id);
+  const old = i >= 0 ? state.goals[i] : null;
+  if (old && old.kind === g.kind && (g.kind !== 'deadline' || old.deadline === g.deadline)) {
+    for (const k of ['streak', 'best', 'passes', 'passMonth', 'evalFrom', 'graceKey', 'settled']) g[k] = old[k];
+  } else initTracking(g, false);
   if (i >= 0) state.goals[i] = g; else state.goals.push(g);
   save(); closeModal(); checkAwards(); render(); toast('Objetivo guardado');
 }
@@ -679,8 +766,9 @@ function renderShop() {
       <div class="rp">${fmtN(rw.price)} ${coin(rw.coinType, 24)}</div>
       <button class="btn ${can ? 'dark' : ''} full" data-act="buy" data-id="${rw.id}" ${can ? '' : 'disabled'}>${can ? 'Canjear' : 'Te faltan ' + fmtN(missing(rw, w))}</button></div>`;
   }).join('');
-  const hist = [...state.purchases].sort((a, b) => b.date - a.date).slice(0, 15).map(p => `<div class="hist-item"><div style="font-size:30px;width:38px;text-align:center">${esc(p.emoji || '🎁')}</div><div class="hm"><b>${esc(p.name)}</b><span>${longDate(p.date)}</span></div>
-    <div class="hv">−${fmtN(p.price)} ${coin(p.coinType, 16)}</div><button class="mini-btn" data-act="undoPurchase" data-id="${p.id}" aria-label="Deshacer">↩︎</button></div>`).join('');
+  const moves = [...state.purchases.map(p => ({ ...p, kind: 'buy' })), ...(state.penalties || []).map(p => ({ ...p, kind: 'pen', emoji: '💔', price: p.amount }))];
+  const hist = moves.sort((a, b) => b.date - a.date).slice(0, 20).map(p => `<div class="hist-item" ${p.kind === 'pen' ? 'style="background:#FFF1EF"' : ''}><div style="font-size:30px;width:38px;text-align:center">${esc(p.emoji || '🎁')}</div><div class="hm"><b>${esc(p.name)}</b><span>${p.real ? 'Gasto real · ' : p.kind === 'pen' ? 'Penalización · ' : ''}${longDate(p.date)}</span></div>
+    <div class="hv">−${fmtN(p.price)} ${coin(p.coinType, 16)}</div><button class="mini-btn" data-act="${p.kind === 'pen' ? 'undoPenalty' : 'undoPurchase'}" data-id="${p.id}" aria-label="Deshacer">↩︎</button></div>`).join('');
   return `${topBar('Tienda', 'Gasta lo que te has ganado')}
     <div class="wallet-hero">
       <div class="w gold">${coin('oro', 56)}<div><div class="n">${fmtN(w.oro)}</div><div class="l">monedas de oro</div></div></div>
@@ -689,9 +777,10 @@ function renderShop() {
         <button class="btn sm" data-act="exchange" data-n="1" ${w.plata >= 2 ? '' : 'disabled'}>Cambiar 2 → 1</button>
         <button class="btn sm ghost" data-act="exchange" data-n="all" ${w.plata >= 2 ? '' : 'disabled'}>Cambiar toda</button></div>
     </div>
+    <button class="real-spend" data-act="realSpend"><span class="emo">💸</span><span class="t"><b>Gasto en la vida real</b><span>¿Te has gastado dinero? Descuéntalo de tus monedas (1 € = 1 moneda)</span></span><span class="btn sm dark">Descontar</span></button>
     <div class="section-h"><h2>Recompensas</h2></div>
     <div class="reward-grid">${rewards}<button class="reward add" data-act="newReward"><span>+</span>Nueva recompensa</button></div>
-    ${hist ? `<section style="margin-top:26px"><div class="section-h"><h2>Lo que te has dado</h2></div>${hist}</section>` : ''}`;
+    ${hist ? `<section style="margin-top:26px"><div class="section-h"><h2>Movimientos</h2></div>${hist}</section>` : ''}`;
 }
 function totalUnits(w) { return w.plata + 2 * w.oro; } // en plata
 function needUnits(rw) { return rw.coinType === 'oro' ? rw.price * 2 : rw.price; }
@@ -714,6 +803,30 @@ function confirmBuy(id) {
   const rw = state.rewards.find(x => x.id === id); const w = wallet(); if (!rw || !canAfford(rw, w)) return closeModal();
   state.purchases.push({ id: uid(), rewardId: rw.id, name: rw.name, emoji: rw.emoji, price: rw.price, coinType: rw.coinType, paid: payPlan(rw, w), date: Date.now() });
   save(); closeModal(); confetti(); toast(`¡A disfrutar! ${rw.emoji || ''}`); render();
+}
+function openRealSpend() {
+  ui.draft = { name: '', amount: 10, coinType: 'oro' };
+  openModal(() => {
+    const d = ui.draft; const w = wallet(); const amt = Math.max(0, Number(d.amount) || 0);
+    const rw = { price: amt, coinType: d.coinType }; const ok = canAfford(rw, w);
+    const plan = ok ? payPlan(rw, w) : null;
+    const parts = []; if (plan && plan.oro) parts.push(`${fmtN(plan.oro)} ${coin('oro', 16)}`); if (plan && plan.plata) parts.push(`${fmtN(plan.plata)} ${coin('plata', 16)}`);
+    return `<div class="sheet"><h2>💸 Gasto en la vida real</h2>
+      <div class="field"><label>¿En qué?</label><input class="inp" value="${esc(d.name)}" data-d="name" placeholder="Compras, cena, ropa…"></div>
+      <div class="field"><label>¿Cuánto? (1 € = 1 moneda)</label><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <input class="inp" style="width:120px" type="number" min="0" step="0.5" inputmode="decimal" value="${d.amount}" data-d="amount" data-rr>
+        <div class="typetoggle">${['oro', 'plata'].map(t => `<button class="${d.coinType === t ? 'on' : ''}" data-act="draftSet" data-k="coinType" data-v="${t}">${coin(t, 18)} ${t}</button>`).join('')}</div></div></div>
+      ${amt > 0 ? (ok ? `<div class="info-box">Se descontarán ${parts.join(' + ')}</div>`
+        : `<div class="info-box" style="background:#FFE3DF">⚠️ No te llega: te quedarás en negativo y tendrás que recuperarlo estudiando.</div>`) : ''}
+      <div class="acts"><button class="btn" data-act="closeModal">Cancelar</button><button class="btn dark" data-act="saveRealSpend" ${amt > 0 ? '' : 'disabled'}>Descontar</button></div></div>`;
+  });
+}
+function saveRealSpend() {
+  const d = ui.draft; const amt = Math.max(0, Number(d.amount) || 0); if (!amt) return;
+  const w = wallet(); const rw = { price: amt, coinType: d.coinType };
+  const paid = canAfford(rw, w) ? payPlan(rw, w) : (d.coinType === 'oro' ? { oro: amt, plata: 0 } : { oro: 0, plata: amt });
+  state.purchases.push({ id: uid(), rewardId: null, name: d.name.trim() || 'Gasto', emoji: '💸', price: amt, coinType: d.coinType, paid, date: Date.now(), real: true });
+  save(); closeModal(); toast(`Descontadas ${fmtN(amt)} de ${d.coinType}`); render();
 }
 function openReward(id) {
   const rw = id ? state.rewards.find(x => x.id === id) : null;
@@ -882,7 +995,7 @@ document.addEventListener('click', e => {
     // setup
     case 'setupStep': ui.setupStep = Number(v); render(); scrollTo(0, 0); break;
     case 'setupNext': ui.setupStep++; render(); scrollTo(0, 0); break;
-    case 'finishSetup': state.setupDone = true; save(); ui.setupStep = 0; location.hash = '#/home'; render(); confetti(); break;
+    case 'finishSetup': state.setupDone = true; state.goals.forEach(g => initTracking(g)); save(); ui.setupStep = 0; location.hash = '#/home'; render(); confetti(); break;
     case 'redoSetup': state.setupDone = false; ui.setupStep = 0; save(); render(); scrollTo(0, 0); break;
     case 'goSubjects': go('subjects'); break;
     case 'goRewards': go('rewards'); break;
@@ -928,6 +1041,9 @@ document.addEventListener('click', e => {
     case 'undoPurchase': { const p = state.purchases.find(x => x.id === id); confirmModal('¿Deshacer canje?', `Te devuelvo las monedas de «${esc(p.name)}».`, 'Deshacer', () => { state.purchases = state.purchases.filter(x => x.id !== id); save(); render(); }); break; }
     case 'exchange': { const w = wallet(); const n = el.dataset.n === 'all' ? Math.floor(w.plata / 2) : 1; if (n >= 1 && w.plata >= 2 * n) { state.exchanges.push({ id: uid(), oro: n, date: Date.now() }); save(); render(); toast(`Cambiadas ${n * 2} de plata por ${n} de oro`); } break; }
     case 'newReward': openReward(null); break;
+    case 'realSpend': openRealSpend(); break;
+    case 'saveRealSpend': saveRealSpend(); break;
+    case 'undoPenalty': { const p = state.penalties.find(x => x.id === id); confirmModal('¿Perdonar esta penalización?', `Te devuelvo ${fmtN(p.amount)} de ${p.coinType}. (La racha no vuelve.)`, 'Perdonar', () => { state.penalties = state.penalties.filter(x => x.id !== id); save(); render(); }); break; }
     case 'editReward': openReward(id); break;
     case 'saveReward': saveReward(); break;
     case 'delReward': state.rewards = state.rewards.filter(x => x.id !== id); save(); closeModal(); render(); break;
@@ -949,7 +1065,7 @@ document.addEventListener('input', e => {
 });
 document.addEventListener('change', e => {
   const el = e.target;
-  if (el.dataset.d !== undefined && ui.draft) { ui.draft[el.dataset.d] = el.value; if (el.dataset.d === 'subjectId') ui.draft.categoryId = ''; if (el.dataset.rr !== undefined) rerenderModal(); return; }
+  if (el.dataset.d !== undefined && ui.draft) { ui.draft[el.dataset.d] = el.value; if (el.dataset.d === 'subjectId') ui.draft.categoryId = ''; if (el.dataset.rr !== undefined && el.tagName === 'SELECT') rerenderModal(); return; }
   if (el.id === 'importFile' && el.files[0]) { importData(el.files[0]); el.value = ''; }
   if (el.dataset.sf === 'name' || el.dataset.rf) render();
 });
@@ -975,9 +1091,12 @@ function tick() {
   const c = $('#liveCoins'); if (c) { const s = subj(state.active.subjectId); c.textContent = fmtN(ms / 36e5 * (s ? s.rate : 0)); }
 }
 setInterval(tick, 1000);
+let lastSettleDay = dayKey(new Date());
+setInterval(() => { const k = dayKey(new Date()); if (k !== lastSettleDay) { lastSettleDay = k; runSettle(); render(); } }, 60000);
 
 /* ---------------- Arranque ---------------- */
 checkReturn();
 if (state.active && state.active.runningSince) keepAwake(true);
+runSettle();
 render();
 checkAwards();
