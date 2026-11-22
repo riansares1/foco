@@ -405,9 +405,8 @@ function renderHome() {
   const goalsHtml = todays.length ? todays.map(g => goalCard(g, false)).join('')
     : `<div class="card empty">${buddy('cloud', '#B9A4F7', 'googly')}No tienes objetivos para hoy.<br><button class="link" data-act="go" data-to="goals">Crear uno</button></div>`;
 
-  const weekRows = subjectTotals(ws, addDays(ws, 7)).slice(0, 6);
-  const maxW = Math.max(1, ...weekRows.map(r => r.min));
-  const weekHtml = weekRows.length ? `<div class="sbars">${weekRows.map(r => sbarRow(r, maxW, false)).join('')}</div>`
+  const weekRows = subjectTotals(ws, addDays(ws, 7));
+  const weekHtml = weekRows.length ? donut(weekRows)
     : `<div class="empty">Esta semana aún no hay horas registradas.<br>¡La primera sesión es la más difícil!</div>`;
 
   const a = state.active;
@@ -483,6 +482,23 @@ function subjectTotals(from, to) {
     if (s.categoryId) r.cats.set(s.categoryId, (r.cats.get(s.categoryId) || 0) + s.minutes);
   }
   return [...map.values()].sort((a, b) => b.min - a.min);
+}
+// Gráfico de quesitos (donut) con leyenda
+function donut(rows) {
+  const total = rows.reduce((a, r) => a + r.min, 0) || 1;
+  const R = 70, C = 2 * Math.PI * R, gap = rows.length > 1 ? 3 : 0;
+  let acc = 0;
+  const segs = rows.map((r, i) => {
+    const len = r.min / total * C;
+    const seg = `<circle class="dseg" cx="90" cy="90" r="${R}" fill="none" stroke="${subj(r.id)?.color || '#ccc'}" stroke-width="30"
+      stroke-dasharray="${Math.max(0.5, len - gap)} ${C}" stroke-dashoffset="${-acc}" style="--c:${C};animation-delay:${i * 0.08}s"/>`;
+    acc += len; return seg;
+  }).join('');
+  const legend = rows.slice(0, 8).map(r => { const s = subj(r.id) || { name: 'Borrada', color: '#ccc' };
+    return `<div class="lg"><i style="background:${s.color}"></i><span class="ln">${esc(s.name)}</span><b>${fmtH(r.min)}</b><span class="lp">${Math.round(r.min / total * 100)}%</span></div>`; }).join('')
+    + (rows.length > 8 ? `<div class="lg muted small">+${rows.length - 8} más</div>` : '');
+  return `<div class="donut-wrap"><div class="donut"><svg viewBox="0 0 180 180" width="180" height="180"><circle cx="90" cy="90" r="${R}" fill="none" stroke="#F1ECE2" stroke-width="30"/><g transform="rotate(-90 90 90)">${segs}</g></svg>
+    <div class="dc"><b>${fmtH(total)}</b><span>en total</span></div></div><div class="legend">${legend}</div></div>`;
 }
 function sbarRow(r, max, showCats) {
   const s = subj(r.id) || { name: 'Borrada', color: '#ccc', shape: 'circle', categories: [] };
@@ -748,7 +764,7 @@ function renderStats() {
       <div class="tile" style="background:var(--lime)"><div class="k">Racha · sesiones</div><div class="v">🔥${streak()} · ${sessCount}</div></div>
     </div>
     <div class="home-grid">
-      <section><div class="section-h"><h2>Por asignatura</h2></div><div class="card">${rows.length ? `<div class="sbars">${rows.map(x => sbarRow(x, max, true)).join('')}</div>` : '<div class="empty">Sin horas en este periodo.</div>'}</div></section>
+      <section><div class="section-h"><h2>Por asignatura</h2></div><div class="card">${rows.length ? donut(rows) + `<div class="sbars" style="margin-top:22px">${rows.map(x => sbarRow(x, max, true)).join('')}</div>` : '<div class="empty">Sin horas en este periodo.</div>'}</div></section>
       <section><div class="section-h"><h2>Últimos 14 días</h2></div><div class="card"><div class="cols">${cols}</div></div></section>
     </div>
     <section style="margin-top:22px"><div class="section-h"><h2>Historial</h2></div>${histHtml || '<div class="card empty">Nada por aquí todavía.</div>'}</section>`;
